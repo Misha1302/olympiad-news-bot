@@ -1,114 +1,210 @@
-# Olympiad News Bot with GigaChat
+# Olympiad News Bot
 
-Telegram-бот следит за олимпиадными каналами, быстро отсекает явно нерелевантные сообщения по ключевым словам, а затем уточняет решение через GigaChat API.
+Простой Telegram-бот для мониторинга олимпиадных каналов.
 
-Бот не использует браузерную автоматизацию: Selenium, ChromeDriver, cookies и ручной вход в веб-интерфейс не нужны.
+Бот читает сообщения из заданных Telegram-каналов, проверяет их по ключевым словам и через GigaChat, а затем отправляет подходящие новости в нужный чат.
 
-## Требования
+Браузер, Selenium, ChromeDriver и cookies не нужны.
 
-- Python 3.12.
+## 1. Что нужно заранее
 
-Проект зафиксирован на Python 3.12 через `.python-version`. Не создавайте виртуальное окружение на Python 3.13/3.14: текущая версия Telethon из зависимостей импортирует стандартный модуль `imghdr`, которого в новых версиях Python уже нет.
+Перед запуском подготовьте:
 
-## Что входит в репозиторий
+1. **Python 3.12**.
+2. `TELEGRAM_API_ID` и `TELEGRAM_API_HASH` — взять на https://my.telegram.org.
+3. `TELEGRAM_BOT_TOKEN` — создать бота через `@BotFather`.
+4. `IDS_TO_CHAT` — id чата или пользователя, куда бот будет отправлять новости.
+5. `GIGACHAT_AUTH_KEY` — ключ авторизации GigaChat API.
 
-- `src/olympiad_news_bot/main.py` — основной код бота.
-- `SECRETS.example.py` — шаблон локального файла с секретами.
-- `requirements.txt` — зависимости Python.
-- `.env.example` — fallback-конфигурация для CI/хостинга без секретов.
-- `.gitignore` — защита от случайного коммита токенов, сессий и runtime-файлов.
-- `SECURITY.md` — правила по секретам.
-- `.github/workflows/python-check.yml` — минимальная проверка синтаксиса в CI.
+Важно: используйте именно **Python 3.12**. На Python 3.13/3.14 бот может упасть из-за зависимости Telethon от модуля `imghdr`.
 
-## Что нельзя хранить в GitHub
+## 2. Установка проекта
 
-Не коммитьте:
+Склонируйте репозиторий:
 
-- реальные `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `TELEGRAM_BOT_TOKEN`;
-- `GIGACHAT_AUTH_KEY`;
-- локальный `SECRETS.py`;
-- `.env` с реальными значениями;
-- `*.session`, `*.session-journal` от Telethon;
-- debug screenshots и runtime logs;
-- `*.pyc`, `__pycache__`, `.runtime/`.
+```bash
+git clone https://github.com/Misha1302/olympiad-news-bot.git
+cd olympiad-news-bot
+```
 
-## Быстрый запуск на Linux/macOS
+Создайте виртуальное окружение и установите зависимости:
 
 ```bash
 python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
+```
+
+Если команда `python3.12` не найдена, сначала установите Python 3.12 для своей системы.
+
+## 3. Настройка секретов
+
+Скопируйте пример файла секретов:
+
+```bash
 cp SECRETS.example.py SECRETS.py
+```
+
+Откройте файл:
+
+```bash
 nano SECRETS.py
-PYTHONPATH=src python -m olympiad_news_bot.main
 ```
 
-Если `python3.12` не найден на Fedora, установите Python 3.12 через пакетный менеджер или `pyenv`, затем удалите старое `.venv` и создайте его заново.
-
-## Быстрый запуск на Windows PowerShell
-
-```powershell
-py -3.12 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-copy SECRETS.example.py SECRETS.py
-notepad SECRETS.py
-$env:PYTHONPATH="src"
-python -m olympiad_news_bot.main
-```
-
-## Настройка `SECRETS.py`
-
-Минимально нужны:
+Заполните реальные значения:
 
 ```python
 TELEGRAM_API_ID = 123456
-TELEGRAM_API_HASH = "..."
-TELEGRAM_BOT_TOKEN = "..."
+TELEGRAM_API_HASH = "your_api_hash"
+TELEGRAM_BOT_TOKEN = "your_bot_token"
+
 IDS_TO_CHAT = ["123456789"]
+
 GIGACHAT_ENABLED = True
-GIGACHAT_AUTH_KEY = "..."
+GIGACHAT_AUTH_KEY = "your_gigachat_auth_key"
 ```
 
-`GIGACHAT_AUTH_KEY` — это authorization key для получения OAuth access token. Можно указать ключ без префикса `Basic`; код сам добавит `Basic `. Если ключ уже начинается с `Basic `, он будет использован как есть.
+`SECRETS.py` — локальный файл. Его нельзя коммитить в GitHub.
 
-`SECRETS.py` можно положить в корень репозитория или в `src/olympiad_news_bot/SECRETS.py`. Переменные окружения и `.env` остаются fallback-вариантом для CI или хостинга.
-
-## Важные настройки GigaChat
+Если GigaChat пока не нужен, можно временно отключить его:
 
 ```python
-GIGACHAT_SCOPE = "GIGACHAT_API_PERS"
-GIGACHAT_MODEL = "GigaChat"
-GIGACHAT_VERIFY_SSL = True
-GIGACHAT_TIMEOUT_SECONDS = 30
-GIGACHAT_MAX_RETRIES = 3
-GIGACHAT_FAIL_OPEN = True
-GIGACHAT_MAX_TEXT_CHARS = 5000
+GIGACHAT_ENABLED = False
+GIGACHAT_AUTH_KEY = ""
 ```
 
-`GIGACHAT_FAIL_OPEN = True` означает: если сообщение прошло фильтр ключевых слов, но GigaChat временно недоступен, бот всё равно отправит сообщение. Это снижает риск пропустить важную новость, но может дать больше шума. Если важнее не спамить, поставьте `False`.
+Тогда бот будет использовать только локальный фильтр по ключевым словам.
 
-`GIGACHAT_VERIFY_SSL = True` безопаснее. Если локальная система не доверяет сертификатам GigaChat и запросы падают на SSL verification, временно можно поставить `False`, но это хуже с точки зрения безопасности.
+## 4. Запуск
 
-## Как работает фильтрация
+Запустите бота из корня репозитория:
 
-1. Telegram-сообщение попадает в очередь.
-2. Быстрый локальный фильтр ищет олимпиадные ключевые слова и платформы.
-3. Если локальный фильтр прошёл, сообщение отправляется в GigaChat.
-4. GigaChat обязан вернуть только `ДА` или `НЕТ`.
-5. При `ДА` бот пересылает короткое уведомление в заданные чаты.
+```bash
+source .venv/bin/activate
+PYTHONPATH=src python -m olympiad_news_bot.main
+```
 
-## Ошибка `ModuleNotFoundError: No module named 'imghdr'`
+При первом запуске Telethon может попросить:
 
-Эта ошибка означает, что виртуальное окружение создано на слишком новой версии Python. Удалите `.venv` и пересоздайте его на Python 3.12:
+1. номер телефона Telegram;
+2. код входа из Telegram;
+3. пароль двухэтапной аутентификации, если он включён.
+
+После успешного входа рядом появится локальная Telegram-сессия. Повторно входить обычно не нужно.
+
+## 5. Как поменять каналы
+
+Каналы можно указать в `SECRETS.py`:
+
+```python
+MONITOR_CHANNELS = [
+    "@codeforces_official",
+    "@olymp_itmo11",
+    "@olymp_mephi",
+]
+```
+
+Если `MONITOR_CHANNELS` пустой или не указан, бот использует список каналов по умолчанию из кода.
+
+## 6. Как остановить бота
+
+В терминале нажмите:
+
+```text
+Ctrl+C
+```
+
+Если бот завис или был случайно запущен несколько раз:
+
+```bash
+pkill -f olympiad_news_bot
+```
+
+## 7. Частые ошибки
+
+### `ModuleNotFoundError: No module named 'imghdr'`
+
+Скорее всего виртуальное окружение создано на Python 3.13 или новее.
+
+Исправление:
 
 ```bash
 rm -rf .venv
 python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
+```
+
+### `sqlite3.OperationalError: database is locked`
+
+Обычно это значит, что уже запущена другая копия бота с той же Telegram-сессией.
+
+Исправление:
+
+```bash
+pkill -f olympiad_news_bot
+rm -f .runtime/*.session-journal .runtime/*.session-wal .runtime/*.session-shm
+```
+
+После этого запустите бота снова.
+
+### Ошибка SSL при обращении к GigaChat
+
+Сначала попробуйте оставить безопасный вариант:
+
+```python
+GIGACHAT_VERIFY_SSL = True
+```
+
+Если система не доверяет сертификатам GigaChat, можно создать локальный bundle сертификатов:
+
+```bash
+source .venv/bin/activate
+python scripts/install_gigachat_certs.py
+```
+
+Скрипт напечатает команду `export REQUESTS_CA_BUNDLE=...`. Выполните её перед запуском бота.
+
+Временный небезопасный вариант:
+
+```python
+GIGACHAT_VERIFY_SSL = False
+```
+
+Используйте его только если нужно срочно проверить запуск.
+
+## 8. Какие файлы нельзя выкладывать в GitHub
+
+Не коммитьте:
+
+```text
+SECRETS.py
+.env
+.runtime/
+*.session
+*.session-journal
+*.sqlite
+*.sqlite3
+logs/
+*.log
+__pycache__/
+.venv/
+```
+
+Эти файлы уже добавлены в `.gitignore`, но всё равно проверяйте перед коммитом.
+
+## 9. Короткая памятка запуска
+
+```bash
+git clone https://github.com/Misha1302/olympiad-news-bot.git
+cd olympiad-news-bot
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+cp SECRETS.example.py SECRETS.py
+nano SECRETS.py
 PYTHONPATH=src python -m olympiad_news_bot.main
 ```
