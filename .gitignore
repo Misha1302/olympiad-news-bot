@@ -1,19 +1,17 @@
 # Local configuration and secrets
 .env
+SECRETS.py
+src/olympiad_news_bot/SECRETS.py
 config.py
 *.session
 *.session-journal
-*.pkl
 *.sqlite
 *.sqlite3
 
 # Runtime state
 .runtime/
-chrome_profile/
 logs/
 *.log
-screenshots/
-deepseek_debug.png
 
 # Python
 __pycache__/
