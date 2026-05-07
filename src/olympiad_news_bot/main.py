@@ -7,6 +7,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
+from importlib import import_module
 from typing import Any
 
 import requests
@@ -17,6 +18,54 @@ from telethon import TelegramClient, events
 from telethon.errors import PhoneNumberInvalidError, SessionPasswordNeededError
 
 load_dotenv()
+
+SECRET_NAMES = (
+    "TELEGRAM_API_ID",
+    "TELEGRAM_API_HASH",
+    "TELEGRAM_BOT_TOKEN",
+    "IDS_TO_CHAT",
+    "MONITOR_CHANNELS",
+    "GIGACHAT_ENABLED",
+    "GIGACHAT_AUTH_KEY",
+    "GIGACHAT_SCOPE",
+    "GIGACHAT_MODEL",
+    "GIGACHAT_VERIFY_SSL",
+    "GIGACHAT_TIMEOUT_SECONDS",
+    "GIGACHAT_MAX_RETRIES",
+    "GIGACHAT_FAIL_OPEN",
+    "GIGACHAT_MAX_TEXT_CHARS",
+)
+
+
+def load_local_secrets() -> dict[str, Any]:
+    """
+    Load local secrets from SECRETS.py without forcing that file into Git.
+
+    Supported locations:
+    - SECRETS.py in the repository root;
+    - src/olympiad_news_bot/SECRETS.py for package-local deployments.
+
+    Environment variables remain as a fallback for CI and hosting platforms.
+    """
+
+    for module_name in ("SECRETS", "olympiad_news_bot.SECRETS"):
+        try:
+            module = import_module(module_name)
+        except ModuleNotFoundError as error:
+            if error.name == module_name:
+                continue
+            raise
+
+        return {
+            name: getattr(module, name)
+            for name in SECRET_NAMES
+            if hasattr(module, name)
+        }
+
+    return {}
+
+
+LOCAL_SECRETS = load_local_secrets()
 
 DEFAULT_MONITOR_CHANNELS = [
     "@codeforces_official",
@@ -99,6 +148,30 @@ class ConfigurationError(RuntimeError):
     pass
 
 
+def stringify_config_value(value: Any) -> str:
+    if value is None:
+        return ""
+
+    if isinstance(value, bool):
+        return "true" if value else "false"
+
+    if isinstance(value, (list, tuple, set)):
+        return ",".join(
+            item
+            for item in (str(raw_item).strip() for raw_item in value)
+            if item
+        )
+
+    return str(value).strip()
+
+
+def read_config(name: str, default: Any = "") -> str:
+    if name in LOCAL_SECRETS:
+        return stringify_config_value(LOCAL_SECRETS[name])
+
+    return stringify_config_value(os.getenv(name, default))
+
+
 def parse_csv(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
@@ -109,10 +182,10 @@ def parse_bool(value: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-def read_required_env(name: str) -> str:
-    value = os.getenv(name, "").strip()
+def read_required_config(name: str) -> str:
+    value = read_config(name)
     if not value:
-        raise ConfigurationError(f"Environment variable {name} is required")
+        raise ConfigurationError(f"Configuration value {name} is required")
     return value
 
 
@@ -135,13 +208,13 @@ class Settings:
 
     @staticmethod
     def load() -> "Settings":
-        channels_env = os.getenv("MONITOR_CHANNELS", "")
-        ids_to_chat = parse_csv(read_required_env("IDS_TO_CHAT"))
+        channels_config = read_config("MONITOR_CHANNELS")
+        ids_to_chat = parse_csv(read_required_config("IDS_TO_CHAT"))
         if not ids_to_chat:
             raise ConfigurationError("IDS_TO_CHAT must contain at least one chat ID")
 
-        gigachat_enabled = parse_bool(os.getenv("GIGACHAT_ENABLED", "true"), default=True)
-        gigachat_auth_key = os.getenv("GIGACHAT_AUTH_KEY", "").strip() or None
+        gigachat_enabled = parse_bool(read_config("GIGACHAT_ENABLED", "true"), default=True)
+        gigachat_auth_key = read_config("GIGACHAT_AUTH_KEY") or None
         if gigachat_enabled and not gigachat_auth_key:
             raise ConfigurationError(
                 "GIGACHAT_AUTH_KEY is required when GIGACHAT_ENABLED=true. "
@@ -149,20 +222,20 @@ class Settings:
             )
 
         return Settings(
-            telegram_api_id=int(read_required_env("TELEGRAM_API_ID")),
-            telegram_api_hash=read_required_env("TELEGRAM_API_HASH"),
-            telegram_bot_token=read_required_env("TELEGRAM_BOT_TOKEN"),
+            telegram_api_id=int(read_required_config("TELEGRAM_API_ID")),
+            telegram_api_hash=read_required_config("TELEGRAM_API_HASH"),
+            telegram_bot_token=read_required_config("TELEGRAM_BOT_TOKEN"),
             ids_to_chat=ids_to_chat,
-            monitor_channels=parse_csv(channels_env) or DEFAULT_MONITOR_CHANNELS,
+            monitor_channels=parse_csv(channels_config) or DEFAULT_MONITOR_CHANNELS,
             gigachat_enabled=gigachat_enabled,
             gigachat_auth_key=gigachat_auth_key,
-            gigachat_scope=os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS").strip(),
-            gigachat_model=os.getenv("GIGACHAT_MODEL", "GigaChat").strip(),
-            gigachat_verify_ssl=parse_bool(os.getenv("GIGACHAT_VERIFY_SSL", "true"), default=True),
-            gigachat_timeout_seconds=int(os.getenv("GIGACHAT_TIMEOUT_SECONDS", "30")),
-            gigachat_max_retries=int(os.getenv("GIGACHAT_MAX_RETRIES", "3")),
-            gigachat_fail_open=parse_bool(os.getenv("GIGACHAT_FAIL_OPEN", "true"), default=True),
-            gigachat_max_text_chars=int(os.getenv("GIGACHAT_MAX_TEXT_CHARS", "5000")),
+            gigachat_scope=read_config("GIGACHAT_SCOPE", "GIGACHAT_API_PERS"),
+            gigachat_model=read_config("GIGACHAT_MODEL", "GigaChat"),
+            gigachat_verify_ssl=parse_bool(read_config("GIGACHAT_VERIFY_SSL", "true"), default=True),
+            gigachat_timeout_seconds=int(read_config("GIGACHAT_TIMEOUT_SECONDS", "30")),
+            gigachat_max_retries=int(read_config("GIGACHAT_MAX_RETRIES", "3")),
+            gigachat_fail_open=parse_bool(read_config("GIGACHAT_FAIL_OPEN", "true"), default=True),
+            gigachat_max_text_chars=int(read_config("GIGACHAT_MAX_TEXT_CHARS", "5000")),
         )
 
 
