@@ -4,6 +4,12 @@ Telegram-бот следит за олимпиадными каналами, б�
 
 Бот не использует браузерную автоматизацию: Selenium, ChromeDriver, cookies и ручной вход в веб-интерфейс не нужны.
 
+## Требования
+
+- Python 3.12.
+
+Проект зафиксирован на Python 3.12 через `.python-version`. Не создавайте виртуальное окружение на Python 3.13/3.14: текущая версия Telethon из зависимостей импортирует стандартный модуль `imghdr`, которого в новых версиях Python уже нет.
+
 ## Что входит в репозиторий
 
 - `src/olympiad_news_bot/main.py` — основной код бота.
@@ -29,19 +35,23 @@ Telegram-бот следит за олимпиадными каналами, б�
 ## Быстрый запуск на Linux/macOS
 
 ```bash
-python -m venv .venv
+python3.12 -m venv .venv
 source .venv/bin/activate
+python -m pip install --upgrade pip
 pip install -r requirements.txt
 cp SECRETS.example.py SECRETS.py
 nano SECRETS.py
 PYTHONPATH=src python -m olympiad_news_bot.main
 ```
 
+Если `python3.12` не найден на Fedora, установите Python 3.12 через пакетный менеджер или `pyenv`, затем удалите старое `.venv` и создайте его заново.
+
 ## Быстрый запуск на Windows PowerShell
 
 ```powershell
-py -m venv .venv
+py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
 pip install -r requirements.txt
 copy SECRETS.example.py SECRETS.py
 notepad SECRETS.py
@@ -89,3 +99,16 @@ GIGACHAT_MAX_TEXT_CHARS = 5000
 3. Если локальный фильтр прошёл, сообщение отправляется в GigaChat.
 4. GigaChat обязан вернуть только `ДА` или `НЕТ`.
 5. При `ДА` бот пересылает короткое уведомление в заданные чаты.
+
+## Ошибка `ModuleNotFoundError: No module named 'imghdr'`
+
+Эта ошибка означает, что виртуальное окружение создано на слишком новой версии Python. Удалите `.venv` и пересоздайте его на Python 3.12:
+
+```bash
+rm -rf .venv
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+PYTHONPATH=src python -m olympiad_news_bot.main
+```

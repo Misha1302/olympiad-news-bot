@@ -35,6 +35,39 @@ SECRET_NAMES = (
     "GIGACHAT_MAX_TEXT_CHARS",
 )
 
+MAX_TELEGRAM_MESSAGE_LENGTH = 4096
+
+
+def load_local_secrets() -> dict[str, Any]:
+    """
+    Load local secrets from SECRETS.py without forcing that file into Git.
+
+    Supported locations:
+    - SECRETS.py in the repository root;
+    - src/olympiad_news_bot/SECRETS.py for package-local deployments.
+
+    Environment variables remain as a fallback for CI and hosting platforms.
+    """
+
+    for module_name in ("SECRETS", "olympiad_news_bot.SECRETS"):
+        try:
+            module = import_module(module_name)
+        except ModuleNotFoundError as error:
+            if error.name == module_name:
+                continue
+            raise
+
+        return {
+            name: getattr(module, name)
+            for name in SECRET_NAMES
+            if hasattr(module, name)
+        }
+
+    return {}
+
+
+LOCAL_SECRETS = load_local_secrets()
+
 DEFAULT_MONITOR_CHANNELS = [
     "@codeforces_official",
     "@olymp_bmstu",
@@ -111,37 +144,9 @@ PLATFORMS = [
     "международн",
 ]
 
-TELEGRAM_MESSAGE_LIMIT = 4096
-SAFE_TELEGRAM_MESSAGE_LIMIT = 4000
-CONTROL_CHARS_EXCEPT_NEWLINES_AND_TAB = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]")
-AUTHORIZATION_HEADER = "Author" + "ization"
-BASIC_PREFIX = "Basic"
-BEARER_PREFIX = "Bearer"
-
 
 class ConfigurationError(RuntimeError):
     pass
-
-
-def load_local_secrets() -> dict[str, Any]:
-    for module_name in ("SECRETS", "olympiad_news_bot.SECRETS"):
-        try:
-            module = import_module(module_name)
-        except ModuleNotFoundError as error:
-            if error.name == module_name:
-                continue
-            raise
-
-        return {
-            name: getattr(module, name)
-            for name in SECRET_NAMES
-            if hasattr(module, name)
-        }
-
-    return {}
-
-
-LOCAL_SECRETS = load_local_secrets()
 
 
 def stringify_config_value(value: Any) -> str:
@@ -152,7 +157,11 @@ def stringify_config_value(value: Any) -> str:
         return "true" if value else "false"
 
     if isinstance(value, (list, tuple, set)):
-        return ",".join(str(item).strip() for item in value if str(item).strip())
+        return ",".join(
+            item
+            for item in (str(raw_item).strip() for raw_item in value)
+            if item
+        )
 
     return str(value).strip()
 
@@ -164,13 +173,6 @@ def read_config(name: str, default: Any = "") -> str:
     return stringify_config_value(os.getenv(name, default))
 
 
-def read_required_config(name: str) -> str:
-    value = read_config(name)
-    if not value:
-        raise ConfigurationError(f"Configuration value {name} is required")
-    return value
-
-
 def parse_csv(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
@@ -178,23 +180,38 @@ def parse_csv(value: str) -> list[str]:
 def parse_bool(value: str, default: bool = False) -> bool:
     if not value:
         return default
-
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-def normalize_telegram_text(text: str) -> str:
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    return CONTROL_CHARS_EXCEPT_NEWLINES_AND_TAB.sub("", text).strip()
+def read_required_config(name: str) -> str:
+    value = read_config(name)
+    if not value:
+        raise ConfigurationError(f"Configuration value {name} is required")
+    return value
 
 
-def split_telegram_text(text: str, limit: int = SAFE_TELEGRAM_MESSAGE_LIMIT) -> list[str]:
-    if not text:
-        return []
+def split_text_for_telegram(text: str) -> list[str]:
+    if len(text) <= MAX_TELEGRAM_MESSAGE_LENGTH:
+        return [text]
 
-    if limit <= 0 or limit > TELEGRAM_MESSAGE_LIMIT:
-        raise ValueError("Telegram message limit must be between 1 and 4096")
+    parts = []
+    remaining_text = text
+    while len(remaining_text) > MAX_TELEGRAM_MESSAGE_LENGTH:
+        split_at = remaining_text.rfind("\n", 1, MAX_TELEGRAM_MESSAGE_LENGTH + 1)
+        if split_at > 0:
+            split_at += 1
+        else:
+            split_at = remaining_text.rfind(" ", 1, MAX_TELEGRAM_MESSAGE_LENGTH + 1)
+            if split_at <= 0:
+                split_at = MAX_TELEGRAM_MESSAGE_LENGTH
 
-    return [text[start:start + limit] for start in range(0, len(text), limit)]
+        parts.append(remaining_text[:split_at])
+        remaining_text = remaining_text[split_at:]
+
+    if remaining_text:
+        parts.append(remaining_text)
+
+    return parts
 
 
 @dataclass(frozen=True)
@@ -216,6 +233,7 @@ class Settings:
 
     @staticmethod
     def load() -> "Settings":
+        channels_config = read_config("MONITOR_CHANNELS")
         ids_to_chat = parse_csv(read_required_config("IDS_TO_CHAT"))
         if not ids_to_chat:
             raise ConfigurationError("IDS_TO_CHAT must contain at least one chat ID")
@@ -233,7 +251,7 @@ class Settings:
             telegram_api_hash=read_required_config("TELEGRAM_API_HASH"),
             telegram_bot_token=read_required_config("TELEGRAM_BOT_TOKEN"),
             ids_to_chat=ids_to_chat,
-            monitor_channels=parse_csv(read_config("MONITOR_CHANNELS")) or DEFAULT_MONITOR_CHANNELS,
+            monitor_channels=parse_csv(channels_config) or DEFAULT_MONITOR_CHANNELS,
             gigachat_enabled=gigachat_enabled,
             gigachat_auth_key=gigachat_auth_key,
             gigachat_scope=read_config("GIGACHAT_SCOPE", "GIGACHAT_API_PERS"),
@@ -244,6 +262,81 @@ class Settings:
             gigachat_fail_open=parse_bool(read_config("GIGACHAT_FAIL_OPEN", "true"), default=True),
             gigachat_max_text_chars=int(read_config("GIGACHAT_MAX_TEXT_CHARS", "5000")),
         )
+
+
+@dataclass
+class MessageTask:
+    text: str
+    channel_name: str
+    message_id: int
+    created_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if self.created_at is None:
+            self.created_at = datetime.now()
+
+
+class MessageQueue:
+    def __init__(self, max_queue_size: int = 100) -> None:
+        self.queue: asyncio.Queue[MessageTask] = asyncio.Queue(maxsize=max_queue_size)
+        self.stats = {
+            "processed": 0,
+            "skipped": 0,
+            "errors": 0,
+            "queue_size": 0,
+        }
+
+    async def put(self, task: MessageTask) -> bool:
+        try:
+            self.queue.put_nowait(task)
+            self.stats["queue_size"] = self.queue.qsize()
+            print(f"Message added to queue. Queue size: {self.stats['queue_size']}")
+            return True
+        except asyncio.QueueFull:
+            self.stats["skipped"] += 1
+            print(f"Queue is full, message skipped: {task.text[:80]}")
+            return False
+
+    async def get(self) -> MessageTask:
+        task = await self.queue.get()
+        self.stats["queue_size"] = self.queue.qsize()
+        return task
+
+    def task_done(self) -> None:
+        self.queue.task_done()
+        self.stats["processed"] += 1
+        self.stats["queue_size"] = self.queue.qsize()
+
+    def task_failed(self) -> None:
+        self.queue.task_done()
+        self.stats["errors"] += 1
+        self.stats["queue_size"] = self.queue.qsize()
+
+    def get_stats(self) -> dict[str, int]:
+        return {
+            **self.stats,
+            "current_queue_size": self.queue.qsize(),
+        }
+
+
+def remove_non_bmp_chars(text: str) -> str:
+    if not text:
+        return text
+
+    text = re.sub(r"[\U00010000-\U0010FFFF]", "", text)
+    text = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]", "", text)
+    emoji_pattern = re.compile(
+        "["
+        "\U0001F600-\U0001F64F"
+        "\U0001F300-\U0001F5FF"
+        "\U0001F680-\U0001F6FF"
+        "\U0001F1E0-\U0001F1FF"
+        "\U00002702-\U000027B0"
+        "\U000024C2-\U0001F251"
+        "]+",
+        flags=re.UNICODE,
+    )
+    return emoji_pattern.sub("", text).strip()
 
 
 class GigaChatClassifier:
@@ -261,76 +354,126 @@ class GigaChatClassifier:
 
     def check_message(self, text: str) -> bool:
         with self._lock:
-            last_error: Exception | None = None
-            for attempt in range(1, self.settings.gigachat_max_retries + 1):
-                try:
-                    result = self._classify(text)
-                    print(f"GigaChat decision: {'SEND' if result else 'SKIP'}")
-                    return result
-                except Exception as error:
-                    last_error = error
-                    print(f"GigaChat check failed, attempt {attempt}: {error}")
-                    if attempt < self.settings.gigachat_max_retries:
-                        time.sleep(2 ** (attempt - 1))
+            return self._check_message_with_retries(text)
 
-            raise RuntimeError(f"GigaChat check failed after retries: {last_error}")
+    def _check_message_with_retries(self, text: str) -> bool:
+        last_error: Exception | None = None
+        for attempt in range(1, self.settings.gigachat_max_retries + 1):
+            try:
+                result = self._classify(text)
+                print(f"GigaChat decision: {'SEND' if result else 'SKIP'}")
+                return result
+            except Exception as error:
+                last_error = error
+                print(f"GigaChat check failed, attempt {attempt}: {error}")
+                if attempt < self.settings.gigachat_max_retries:
+                    time.sleep(2 ** (attempt - 1))
+
+        raise RuntimeError(f"GigaChat check failed after retries: {last_error}")
 
     def _classify(self, text: str) -> bool:
-        prompt_text = normalize_telegram_text(text)
-        prompt_text = re.sub(r"\s+", " ", prompt_text).strip()
-        prompt_text = prompt_text[: self.settings.gigachat_max_text_chars]
+        cleaned_text = remove_non_bmp_chars(text)
+        cleaned_text = cleaned_text.replace("\n", " ").replace("\r", " ")
+        cleaned_text = re.sub(r"\s+", " ", cleaned_text).strip()
+        cleaned_text = cleaned_text[: self.settings.gigachat_max_text_chars]
+
+        prompt = (
+            "Ты строгий бинарный классификатор Telegram-сообщений для новостного бота.\n"
+            "Цель бота — отправлять ТОЛЬКО сообщения про олимпиады школьников по информатике "
+            "и программированию из перечня РСОШ или явно связанные с поступлением через такие олимпиады.\n\n"
+
+            "Ответь ДА, только если сообщение содержит реальную полезную новость хотя бы одного из типов:\n"
+            "1. регистрация на олимпиаду школьников по информатике/программированию;\n"
+            "2. старт, дедлайн, перенос сроков или расписание этапа такой олимпиады;\n"
+            "3. отборочный, заключительный, финальный этап олимпиады школьников по информатике/программированию;\n"
+            "4. публикация результатов, проходных баллов, списков победителей/призёров;\n"
+            "5. апелляции, дипломы, подтверждение участия, льготы БВИ/100 баллов по информатике;\n"
+            "6. официальная новость конкретной олимпиады из перечня РСОШ по профилю информатика/программирование.\n\n"
+
+            "Типичные релевантные олимпиады и маркеры: Высшая проба по информатике, Технокубок, "
+            "олимпиада ИТМО/олимпиада школьников по информатике, Московская олимпиада школьников по информатике, "
+            "СПбГУ по программированию/информатике, Иннополис, Когнитивные технологии, Росатом по информатике, "
+            "Всесибирская по информатике, Открытая олимпиада школьников по программированию, "
+            "профиль информатика, профиль программирование, РСОШ, БВИ, 100 баллов.\n\n"
+
+            "Ответь НЕТ, если сообщение:\n"
+            "1. про обычный спорт, матч, чемпионат, турнир или спортивное мероприятие;\n"
+            "2. про Codeforces/ICPC/ACM/контест, если нет связи с олимпиадой школьников, РСОШ, БВИ или поступлением;\n"
+            "3. про математику, физику, инженерный конкурс или вузовское мероприятие без информатики/программирования;\n"
+            "4. про студенческие, корпоративные, взрослые или коммерческие соревнования без школьной РСОШ-связи;\n"
+            "5. является техническим тестом, проверкой фильтра, фразой вроде 'не должно пройти', "
+            "'тестовое сообщение', 'проверка', 'ignore this';\n"
+            "6. просто содержит слова 'результаты', 'олимпиада', 'турнир', 'соревнование', но не говорит явно "
+            "о школьной олимпиаде по информатике/программированию.\n\n"
+
+            "Если сомневаешься, ответь НЕТ.\n"
+            "Ответ должен быть строго одним словом: ДА или НЕТ.\n\n"
+            f"Сообщение: {cleaned_text}"
+        )
+
+        payload = {
+            "model": self.settings.gigachat_model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "Ты строгий бинарный классификатор Telegram-сообщений. "
+                        "Не объясняй ответ. Не добавляй Markdown. Верни только ДА или НЕТ."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": prompt,
+                },
+            ],
+            "temperature": 0,
+            "max_tokens": 8,
+        }
 
         response = requests.post(
             self.CHAT_COMPLETIONS_URL,
             headers={
-                AUTHORIZATION_HEADER: f"{BEARER_PREFIX} {self._get_access_token()}",
+                "Authorization": f"Bearer {self._get_access_token()}",
                 "Content-Type": "application/json",
                 "Accept": "application/json",
             },
-            json={
-                "model": self.settings.gigachat_model,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": (
-                            "Ты строгий бинарный классификатор Telegram-сообщений. "
-                            "Не объясняй ответ. Не добавляй Markdown. Верни только ДА или НЕТ."
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": (
-                            "Определи, относится ли сообщение к новостям, анонсам, срокам регистрации, "
-                            "итогам или результатам олимпиад, соревнований по программированию, математике "
-                            "или инженерным конкурсам для школьников/студентов. "
-                            "Ответь строго одним словом: ДА или НЕТ.\n\n"
-                            f"Сообщение: {prompt_text}"
-                        ),
-                    },
-                ],
-                "temperature": 0,
-                "max_tokens": 8,
-            },
+            json=payload,
             timeout=self.settings.gigachat_timeout_seconds,
             verify=self.settings.gigachat_verify_ssl,
         )
 
         if response.status_code == 401:
             self._drop_access_token()
-            return self._classify(text)
+            response = requests.post(
+                self.CHAT_COMPLETIONS_URL,
+                headers={
+                    "Authorization": f"Bearer {self._get_access_token(force_refresh=True)}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+                json=payload,
+                timeout=self.settings.gigachat_timeout_seconds,
+                verify=self.settings.gigachat_verify_ssl,
+            )
 
         response.raise_for_status()
-        return self._parse_answer(response.json())
+        content = self._extract_answer(response.json())
+        return self._parse_answer(content)
 
-    def _get_access_token(self) -> str:
+    def _get_access_token(self, force_refresh: bool = False) -> str:
         now_ms = int(time.time() * 1000)
-        if self._access_token and self._access_token_expires_at_ms > now_ms + 60_000:
+        if (
+            not force_refresh
+            and self._access_token
+            and self._access_token_expires_at_ms > now_ms + 60_000
+        ):
             return self._access_token
 
+        auth_header = self._build_auth_header()
         response = requests.post(
             self.OAUTH_URL,
             headers={
-                AUTHORIZATION_HEADER: self._build_basic_auth_header(),
+                "Authorization": auth_header,
                 "RqUID": str(uuid.uuid4()),
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Accept": "application/json",
@@ -342,46 +485,56 @@ class GigaChatClassifier:
         response.raise_for_status()
 
         data = response.json()
-        self._access_token = str(data.get("access_token", "")).strip()
-        if not self._access_token:
+        access_token = str(data.get("access_token", "")).strip()
+        if not access_token:
             raise RuntimeError("GigaChat OAuth response does not contain access_token")
 
         expires_at = data.get("expires_at")
-        self._access_token_expires_at_ms = int(expires_at) if expires_at else int((time.time() + 25 * 60) * 1000)
-        return self._access_token
+        if expires_at is None:
+            expires_at_ms = int((time.time() + 25 * 60) * 1000)
+        else:
+            expires_at_ms = int(expires_at)
+
+        self._access_token = access_token
+        self._access_token_expires_at_ms = expires_at_ms
+        return access_token
 
     def _drop_access_token(self) -> None:
         self._access_token = None
         self._access_token_expires_at_ms = 0
 
-    def _build_basic_auth_header(self) -> str:
+    def _build_auth_header(self) -> str:
         if not self.settings.gigachat_auth_key:
             raise ConfigurationError("GIGACHAT_AUTH_KEY is required")
 
         auth_key = self.settings.gigachat_auth_key.strip()
-        if auth_key.lower().startswith(f"{BASIC_PREFIX.lower()} "):
+        if auth_key.lower().startswith("basic "):
             return auth_key
-
-        return f"{BASIC_PREFIX} {auth_key}"
+        return f"Basic {auth_key}"
 
     @staticmethod
-    def _parse_answer(response_json: dict[str, Any]) -> bool:
+    def _extract_answer(response_json: dict[str, Any]) -> str:
         try:
-            answer = str(response_json["choices"][0]["message"]["content"]).strip().lower()
+            return str(response_json["choices"][0]["message"]["content"]).strip()
         except (KeyError, IndexError, TypeError) as error:
             raise RuntimeError(f"Unexpected GigaChat response shape: {response_json}") from error
 
-        normalized = answer.replace(".", "").replace("!", "").replace('"', "").replace("'", "")
-        if normalized.startswith(("да", "yes")):
+    @staticmethod
+    def _parse_answer(answer: str) -> bool:
+        normalized = answer.strip().lower()
+        normalized = normalized.replace(".", "").replace("!", "").replace("\"", "")
+        normalized = normalized.replace("'", "")
+
+        if normalized.startswith("да") or normalized.startswith("yes"):
             return True
-
-        if normalized.startswith(("нет", "no")):
+        if normalized.startswith("нет") or normalized.startswith("no"):
             return False
 
-        if any(word in normalized for word in ["не относится", "не связано", "нет"]):
+        positive_words = ["олимп", "соревнован", "конкурс", "задач", "турнир", "чемпионат"]
+        negative_words = ["не относится", "не связано", "нет"]
+        if any(word in normalized for word in negative_words):
             return False
-
-        if any(word in normalized for word in ["олимп", "соревнован", "конкурс", "задач", "турнир", "чемпионат"]):
+        if any(word in normalized for word in positive_words):
             return True
 
         raise RuntimeError(f"Cannot parse GigaChat answer as binary decision: {answer}")
@@ -396,6 +549,10 @@ class SimpleOlympiadBot:
         self.bot: telebot.TeleBot | None = None
         self.gigachat_classifier = GigaChatClassifier(settings) if settings.gigachat_enabled else None
         self.check_count = 0
+        self.message_queue = MessageQueue(max_queue_size=50)
+        self.queue_worker_task: asyncio.Task[Any] | None = None
+        self.stats_print_task: asyncio.Task[Any] | None = None
+        self.is_running = True
 
     def setup_clients(self) -> None:
         self.user_client = TelegramClient(
@@ -421,7 +578,6 @@ class SimpleOlympiadBot:
             except SessionPasswordNeededError:
                 password = input("Введите пароль двухэтапной аутентификации: ")
                 await self.user_client.sign_in(password=password)
-
             print("Telegram authorization completed.")
             return True
         except PhoneNumberInvalidError:
@@ -432,10 +588,10 @@ class SimpleOlympiadBot:
             return False
 
     def is_olympiad_related(self, text: str) -> bool:
-        text_lower = normalize_telegram_text(text).lower()
-        if len(text_lower) < 10:
+        if not text or len(text) < 10:
             return False
 
+        text_lower = remove_non_bmp_chars(text).lower()
         return any(keyword in text_lower for keyword in KEYWORDS) or any(platform in text_lower for platform in PLATFORMS)
 
     async def should_send_message(self, text: str) -> bool:
@@ -458,45 +614,38 @@ class SimpleOlympiadBot:
             if self.settings.gigachat_fail_open:
                 print("Fail-open mode is enabled: SEND because keyword prefilter passed.")
                 return True
-
             print("Fail-open mode is disabled: SKIP.")
             return False
 
-    def get_source_text(self, channel_name: str, message_id: int) -> str:
-        if channel_name.startswith("@"):
-            return f"{channel_name} — https://t.me/{channel_name[1:]}/{message_id}"
-
-        return channel_name
-
-    def format_message_parts(self, text: str, channel_name: str, message_id: int) -> list[str]:
-        text = normalize_telegram_text(text)
-        source_text = self.get_source_text(channel_name, message_id)
-        timestamp = datetime.now().strftime("%H:%M %d.%m.%Y")
-
-        message = (
+    def format_message(self, text: str, channel_name: str, message_id: int) -> str:
+        source_text = self.format_source(channel_name, message_id)
+        return (
             "НОВОСТЬ ОБ ОЛИМПИАДЕ\n\n"
             f"{text}\n\n"
             f"Источник: {source_text}\n"
-            f"Время: {timestamp}\n\n"
+            f"Время: {datetime.now().strftime('%H:%M %d.%m.%Y')}\n\n"
             "#олимпиада #программирование"
         )
 
-        if len(message) <= SAFE_TELEGRAM_MESSAGE_LIMIT:
-            return [message]
+    @staticmethod
+    def format_source(channel_name: str, message_id: int) -> str:
+        if channel_name.startswith("@"):
+            return f"{channel_name}: https://t.me/{channel_name[1:]}/{message_id}"
 
-        metadata = (
-            "НОВОСТЬ ОБ ОЛИМПИАДЕ\n"
-            f"Источник: {source_text}\n"
-            f"Время: {timestamp}\n\n"
-            "Текст длинный, поэтому отправлен без обрезки следующими сообщениями."
-        )
-        return [metadata, *split_telegram_text(text)]
+        return channel_name
 
-    def send_notification_with_retry(self, text: str, channel_name: str, message_id: int) -> bool:
+    def send_notification_with_retry(
+        self,
+        text: str,
+        channel_name: str,
+        message_id: int,
+        max_retries: int = 3,
+    ) -> bool:
         assert self.bot is not None
-        message_parts = self.format_message_parts(text, channel_name, message_id)
+        formatted_message = self.format_message(text, channel_name, message_id)
+        message_parts = split_text_for_telegram(formatted_message)
 
-        for attempt in range(3):
+        for attempt in range(max_retries):
             try:
                 for chat_id in self.ids_to_chat:
                     for message_part in message_parts:
@@ -505,18 +654,28 @@ class SimpleOlympiadBot:
                             message_part,
                             disable_web_page_preview=True,
                         )
-
                 return True
             except Exception as error:
+                wait_time = 2 ** attempt
                 print(f"Notification send failed, attempt {attempt + 1}: {error}")
-                if attempt < 2:
-                    time.sleep(2 ** attempt)
-
+                if attempt < max_retries - 1:
+                    time.sleep(wait_time)
         return False
 
-    async def process_message(self, event: Any) -> None:
-        text = event.message.text or event.message.message or ""
-        if not text.strip():
+    async def process_message_task(self, task: MessageTask) -> None:
+        text = task.text
+        if not text or not text.strip():
+            return
+
+        if await self.should_send_message(text):
+            print(f"Sending olympiad news from {task.channel_name}: {text[:80]}")
+            self.send_notification_with_retry(text, task.channel_name, task.message_id)
+        else:
+            print(f"Message skipped: {text[:80]}")
+
+    async def handle_new_message(self, event: Any) -> None:
+        text = event.message.text or event.message.message
+        if not text or not text.strip():
             return
 
         chat = await event.get_chat()
@@ -527,11 +686,41 @@ class SimpleOlympiadBot:
         else:
             channel_name = f"ID: {chat.id}"
 
-        if await self.should_send_message(text):
-            print(f"Sending olympiad news from {channel_name}: {text[:80]}")
-            self.send_notification_with_retry(text, channel_name, event.message.id)
-        else:
-            print(f"Message skipped: {text[:80]}")
+        task = MessageTask(
+            text=text,
+            channel_name=channel_name,
+            message_id=event.message.id,
+        )
+        await self.message_queue.put(task)
+
+    async def queue_worker(self) -> None:
+        print("Queue worker started.")
+        while self.is_running:
+            try:
+                task = await asyncio.wait_for(self.message_queue.get(), timeout=1.0)
+                try:
+                    await self.process_message_task(task)
+                    self.message_queue.task_done()
+                except Exception as error:
+                    self.message_queue.task_failed()
+                    print(f"Task processing failed: {error}")
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                break
+            except Exception as error:
+                print(f"Queue worker failed: {error}")
+                await asyncio.sleep(1)
+
+    async def print_queue_stats(self) -> None:
+        while self.is_running:
+            try:
+                stats = self.message_queue.get_stats()
+                if stats["processed"] or stats["queue_size"] or stats["errors"]:
+                    print(f"Queue stats: {stats}")
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                break
 
     async def start_monitoring_async(self) -> None:
         assert self.user_client is not None
@@ -544,7 +733,7 @@ class SimpleOlympiadBot:
 
         @self.user_client.on(events.NewMessage(chats=self.monitor_channels))
         async def handler(event: Any) -> None:
-            await self.process_message(event)
+            await self.handle_new_message(event)
 
         print("Monitoring started. Press Ctrl+C to stop.")
         await self.user_client.run_until_disconnected()
@@ -557,6 +746,8 @@ class SimpleOlympiadBot:
         if not await self.authorize_user():
             return
 
+        self.queue_worker_task = asyncio.create_task(self.queue_worker())
+        self.stats_print_task = asyncio.create_task(self.print_queue_stats())
         await self.start_monitoring_async()
 
     def run(self) -> None:
@@ -564,6 +755,13 @@ class SimpleOlympiadBot:
             asyncio.run(self.main_async())
         except KeyboardInterrupt:
             print("Bot stopped by user.")
+        finally:
+            self.is_running = False
+            if self.queue_worker_task:
+                self.queue_worker_task.cancel()
+            if self.stats_print_task:
+                self.stats_print_task.cancel()
+            print(f"Final stats: {self.message_queue.get_stats()}")
 
 
 def main() -> None:
