@@ -1,18 +1,13 @@
-# Security policy
+# Security notes
 
-## Never commit
+Never commit real credentials or runtime sessions:
 
-- Telegram bot tokens.
-- Telegram API ID/API hash.
-- Telethon session files: `*.session`, `*.session-journal`.
-- Browser cookies: `*.pkl`, especially `deepseek_cookies.pkl`.
-- Local `.env` and `config.py` files with real values.
-- Compiled Python files: `*.pyc`, because they can still contain recoverable constants.
+- Telegram `API_ID`, `API_HASH`, `BOT_TOKEN`;
+- GigaChat authorization key;
+- `.env` and `config.py` with secrets;
+- Telethon `*.session` and `*.session-journal` files;
+- cookies, browser profiles, debug screenshots and logs.
 
-## If a secret was committed or shared
+Use `.env.example` as a template and keep the real `.env` only on the machine where the bot runs.
 
-1. Revoke the Telegram bot token in @BotFather and create a new one.
-2. Recreate or rotate Telegram API credentials where possible.
-3. Terminate unknown Telegram sessions in Telegram settings.
-4. Delete DeepSeek cookies and sign in again.
-5. Rewrite public Git history if the secret reached GitHub.
+If a token or session file was accidentally sent to a public repository, consider it compromised and rotate it immediately.

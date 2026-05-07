@@ -1,22 +1,18 @@
 import asyncio
 import html
 import os
-import pickle
 import re
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
+import requests
 import telebot
+import urllib3
 from dotenv import load_dotenv
-from selenium import webdriver
-from selenium.common.exceptions import InvalidSessionIdException, WebDriverException
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.support.ui import WebDriverWait
 from telethon import TelegramClient, events
 from telethon.errors import PhoneNumberInvalidError, SessionPasswordNeededError
 
@@ -99,14 +95,24 @@ PLATFORMS = [
 ]
 
 
+class ConfigurationError(RuntimeError):
+    pass
+
+
 def parse_csv(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def parse_bool(value: str, default: bool = False) -> bool:
+    if not value:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def read_required_env(name: str) -> str:
     value = os.getenv(name, "").strip()
     if not value:
-        raise RuntimeError(f"Environment variable {name} is required")
+        raise ConfigurationError(f"Environment variable {name} is required")
     return value
 
 
@@ -117,17 +123,30 @@ class Settings:
     telegram_bot_token: str
     ids_to_chat: list[str]
     monitor_channels: list[str]
-    deepseek_enabled: bool
-    deepseek_headless: bool
-    deepseek_cookies_file: Path
-    deepseek_max_checks_before_restart: int
+    gigachat_enabled: bool
+    gigachat_auth_key: str | None
+    gigachat_scope: str
+    gigachat_model: str
+    gigachat_verify_ssl: bool
+    gigachat_timeout_seconds: int
+    gigachat_max_retries: int
+    gigachat_fail_open: bool
+    gigachat_max_text_chars: int
 
     @staticmethod
     def load() -> "Settings":
         channels_env = os.getenv("MONITOR_CHANNELS", "")
         ids_to_chat = parse_csv(read_required_env("IDS_TO_CHAT"))
         if not ids_to_chat:
-            raise RuntimeError("IDS_TO_CHAT must contain at least one chat ID")
+            raise ConfigurationError("IDS_TO_CHAT must contain at least one chat ID")
+
+        gigachat_enabled = parse_bool(os.getenv("GIGACHAT_ENABLED", "true"), default=True)
+        gigachat_auth_key = os.getenv("GIGACHAT_AUTH_KEY", "").strip() or None
+        if gigachat_enabled and not gigachat_auth_key:
+            raise ConfigurationError(
+                "GIGACHAT_AUTH_KEY is required when GIGACHAT_ENABLED=true. "
+                "Set GIGACHAT_ENABLED=false to use only keyword filtering."
+            )
 
         return Settings(
             telegram_api_id=int(read_required_env("TELEGRAM_API_ID")),
@@ -135,10 +154,15 @@ class Settings:
             telegram_bot_token=read_required_env("TELEGRAM_BOT_TOKEN"),
             ids_to_chat=ids_to_chat,
             monitor_channels=parse_csv(channels_env) or DEFAULT_MONITOR_CHANNELS,
-            deepseek_enabled=os.getenv("DEEPSEEK_ENABLED", "true").lower() in {"1", "true", "yes", "y"},
-            deepseek_headless=os.getenv("DEEPSEEK_HEADLESS", "false").lower() in {"1", "true", "yes", "y"},
-            deepseek_cookies_file=Path(os.getenv("DEEPSEEK_COOKIES_FILE", ".runtime/deepseek_cookies.pkl")),
-            deepseek_max_checks_before_restart=int(os.getenv("DEEPSEEK_MAX_CHECKS_BEFORE_RESTART", "5")),
+            gigachat_enabled=gigachat_enabled,
+            gigachat_auth_key=gigachat_auth_key,
+            gigachat_scope=os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS").strip(),
+            gigachat_model=os.getenv("GIGACHAT_MODEL", "GigaChat").strip(),
+            gigachat_verify_ssl=parse_bool(os.getenv("GIGACHAT_VERIFY_SSL", "true"), default=True),
+            gigachat_timeout_seconds=int(os.getenv("GIGACHAT_TIMEOUT_SECONDS", "30")),
+            gigachat_max_retries=int(os.getenv("GIGACHAT_MAX_RETRIES", "3")),
+            gigachat_fail_open=parse_bool(os.getenv("GIGACHAT_FAIL_OPEN", "true"), default=True),
+            gigachat_max_text_chars=int(os.getenv("GIGACHAT_MAX_TEXT_CHARS", "5000")),
         )
 
 
@@ -186,6 +210,11 @@ class MessageQueue:
         self.stats["processed"] += 1
         self.stats["queue_size"] = self.queue.qsize()
 
+    def task_failed(self) -> None:
+        self.queue.task_done()
+        self.stats["errors"] += 1
+        self.stats["queue_size"] = self.queue.qsize()
+
     def get_stats(self) -> dict[str, int]:
         return {
             **self.stats,
@@ -231,298 +260,179 @@ def clean_text_for_telegram(text: str) -> str:
     return text.strip()
 
 
-class DeepSeekChecker:
+class GigaChatClassifier:
+    OAUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
+    CHAT_COMPLETIONS_URL = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
+
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.driver: Optional[webdriver.Chrome] = None
-        self.wait: Optional[WebDriverWait] = None
-        self.initialized = False
-        self.last_reset_time = time.time()
-        self.session_checks_count = 0
-        self.processing_lock = threading.Lock()
+        self._access_token: str | None = None
+        self._access_token_expires_at_ms = 0
+        self._lock = threading.Lock()
 
-    def save_cookies(self) -> bool:
-        try:
-            if not self.driver:
-                return False
-
-            self.settings.deepseek_cookies_file.parent.mkdir(parents=True, exist_ok=True)
-            cookies = self.driver.get_cookies()
-            with self.settings.deepseek_cookies_file.open("wb") as file:
-                pickle.dump(cookies, file, protocol=pickle.HIGHEST_PROTOCOL)
-            print(f"Cookies saved: {len(cookies)}")
-            return True
-        except (InvalidSessionIdException, WebDriverException) as error:
-            print(f"Cannot save cookies, browser session is not valid: {error}")
-            return False
-        except Exception as error:
-            print(f"Cannot save cookies: {error}")
-            return False
-
-    def load_cookies(self) -> list[dict[str, Any]] | None:
-        try:
-            if not self.settings.deepseek_cookies_file.exists():
-                return None
-
-            with self.settings.deepseek_cookies_file.open("rb") as file:
-                cookies = pickle.load(file)
-            print(f"Cookies loaded: {len(cookies)}")
-            return cookies
-        except Exception as error:
-            print(f"Cannot load cookies: {error}")
-            return None
-
-    def check_driver_alive(self) -> bool:
-        try:
-            if not self.driver:
-                return False
-            _ = self.driver.current_url
-            return True
-        except Exception:
-            return False
-
-    def login_manually_if_needed(self) -> bool:
-        try:
-            if not self.check_driver_alive() or not self.driver:
-                return True
-
-            page_source = self.driver.page_source.lower()
-            login_indicators = [
-                "sign in",
-                "signin",
-                "log in",
-                "login",
-                "войти",
-                "авторизация",
-                "войдите",
-                "email",
-                "password",
-                "пароль",
-            ]
-
-            if any(indicator in page_source for indicator in login_indicators):
-                return True
-
-            return self.find_textarea() is None
-        except Exception as error:
-            print(f"Cannot detect login state: {error}")
-            return True
-
-    def wait_for_manual_login(self, timeout_seconds: int = 120) -> bool:
-        print("Manual DeepSeek login is required in the opened browser window.")
-        started_at = time.time()
-        while time.time() - started_at < timeout_seconds:
-            if not self.login_manually_if_needed():
-                self.save_cookies()
-                print("DeepSeek login detected.")
-                return True
-            time.sleep(3)
-        print("DeepSeek login timeout.")
-        return False
-
-    def initialize_driver(self, retry_count: int = 3) -> bool:
-        for attempt in range(1, retry_count + 1):
-            try:
-                print(f"Initializing browser, attempt {attempt}...")
-                self.cleanup()
-
-                options = Options()
-                if self.settings.deepseek_headless:
-                    options.add_argument("--headless=new")
-                options.add_argument("--no-sandbox")
-                options.add_argument("--disable-dev-shm-usage")
-                options.add_argument("--disable-gpu")
-                options.add_argument("--window-size=1920,1080")
-                options.add_argument("--disable-blink-features=AutomationControlled")
-                options.add_argument("--user-data-dir=.runtime/chrome_profile")
-                options.add_experimental_option("excludeSwitches", ["enable-automation"])
-                options.add_experimental_option("useAutomationExtension", False)
-
-                self.driver = webdriver.Chrome(options=options)
-                self.driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-                self.driver.implicitly_wait(10)
-                self.wait = WebDriverWait(self.driver, 15)
-
-                self.driver.get("https://chat.deepseek.com/")
-                time.sleep(3)
-
-                cookies = self.load_cookies()
-                if cookies:
-                    self.driver.delete_all_cookies()
-                    for cookie in cookies:
-                        if "name" in cookie and "value" in cookie:
-                            self.driver.add_cookie(cookie)
-                    self.driver.refresh()
-                    time.sleep(3)
-
-                if self.login_manually_if_needed() and not self.wait_for_manual_login():
-                    continue
-
-                self.initialized = True
-                self.session_checks_count = 0
-                self.last_reset_time = time.time()
-                self.save_cookies()
-                return True
-            except Exception as error:
-                print(f"Browser initialization failed: {error}")
-                time.sleep(2)
-
-        return False
-
-    def find_textarea(self) -> Any | None:
-        if not self.driver:
-            return None
-
-        selectors = [
-            "[data-testid='message-input']",
-            "textarea",
-            "div[contenteditable='true']",
-            ".ProseMirror",
-            "input[type='text']",
-            "div[role='textbox']",
-            ".chat-input",
-            "#prompt-textarea",
-        ]
-
-        for selector in selectors:
-            try:
-                for element in self.driver.find_elements(By.CSS_SELECTOR, selector):
-                    if element.is_displayed() and element.is_enabled():
-                        return element
-            except Exception:
-                continue
-        return None
-
-    def reset_chat_session(self) -> bool:
-        if not self.driver and not self.initialize_driver():
-            return False
-
-        try:
-            self.save_cookies()
-            self.driver.execute_script("window.location.href = 'https://chat.deepseek.com/';")
-            time.sleep(3)
-            if self.login_manually_if_needed():
-                return self.wait_for_manual_login(timeout_seconds=60)
-            return self.find_textarea() is not None
-        except Exception as error:
-            print(f"Cannot reset DeepSeek session: {error}")
-            return False
-
-    def safe_send_keys(self, element: Any, text: str) -> bool:
-        cleaned_text = remove_non_bmp_chars(text)
-        try:
-            element.clear()
-            time.sleep(0.3)
-            for index in range(0, len(cleaned_text), 100):
-                element.send_keys(cleaned_text[index:index + 100])
-                time.sleep(0.05)
-            element.send_keys("\n")
-            return True
-        except Exception as error:
-            print(f"Normal input failed, trying JavaScript input: {error}")
-            try:
-                self.driver.execute_script(
-                    """
-                    arguments[0].value = arguments[1];
-                    arguments[0].dispatchEvent(new Event('input', { bubbles: true }));
-                    arguments[0].dispatchEvent(new Event('change', { bubbles: true }));
-                    """,
-                    element,
-                    cleaned_text,
-                )
-                return True
-            except Exception:
-                return False
-
-    def get_last_response(self) -> str | None:
-        if not self.driver:
-            return None
-
-        time.sleep(2)
-        try:
-            markdown_elements = self.driver.find_elements(By.CLASS_NAME, "ds-markdown")
-            if markdown_elements:
-                text = markdown_elements[-1].text.strip()
-                if text:
-                    return text
-        except Exception:
-            pass
-
-        try:
-            body_text = self.driver.find_element(By.TAG_NAME, "body").text
-            for line in body_text.split("\n"):
-                normalized = line.strip().lower()
-                if normalized in {"да", "нет"}:
-                    return normalized.upper()
-        except Exception:
-            pass
-
-        return None
-
-    def check_with_deepseek(self, text: str, retry_count: int = 3) -> bool:
-        for attempt in range(1, retry_count + 1):
-            try:
-                if not self.initialized and not self.initialize_driver():
-                    continue
-
-                self.session_checks_count += 1
-                if self.session_checks_count >= self.settings.deepseek_max_checks_before_restart:
-                    self.cleanup()
-                    if not self.initialize_driver():
-                        continue
-
-                cleaned_text = remove_non_bmp_chars(text[:5000].replace("\n", " ").replace("\r", ""))
-                prompt = (
-                    f'Проанализируй это сообщение: "{cleaned_text}". '
-                    'Относится ли оно к новостям, анонсам или итогам олимпиад? '
-                    'Ответь только "ДА" или "НЕТ".'
-                )
-
-                textarea = self.find_textarea()
-                if textarea is None:
-                    if not self.reset_chat_session():
-                        continue
-                    textarea = self.find_textarea()
-                    if textarea is None:
-                        continue
-
-                if not self.safe_send_keys(textarea, prompt):
-                    continue
-
-                time.sleep(10)
-                response = self.get_last_response()
-                if not response:
-                    continue
-
-                response_lower = remove_non_bmp_chars(response).lower()
-                if "да" in response_lower:
-                    return True
-                if "нет" in response_lower:
-                    return False
-
-                positive_words = ["олимп", "соревнован", "конкурс", "задач", "решен", "турнир", "чемпионат"]
-                return any(word in response_lower for word in positive_words)
-            except Exception as error:
-                print(f"DeepSeek check failed on attempt {attempt}: {error}")
-                time.sleep(2)
-
-        return False
+        if not settings.gigachat_verify_ssl:
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     def check_message(self, text: str) -> bool:
-        with self.processing_lock:
-            return self.check_with_deepseek(text)
+        with self._lock:
+            return self._check_message_with_retries(text)
 
-    def cleanup(self) -> None:
-        if self.driver:
+    def _check_message_with_retries(self, text: str) -> bool:
+        last_error: Exception | None = None
+        for attempt in range(1, self.settings.gigachat_max_retries + 1):
             try:
-                self.save_cookies()
-                self.driver.quit()
-            except Exception:
-                pass
-            finally:
-                self.driver = None
-                self.wait = None
-                self.initialized = False
+                result = self._classify(text)
+                print(f"GigaChat decision: {'SEND' if result else 'SKIP'}")
+                return result
+            except Exception as error:
+                last_error = error
+                print(f"GigaChat check failed, attempt {attempt}: {error}")
+                if attempt < self.settings.gigachat_max_retries:
+                    time.sleep(2 ** (attempt - 1))
+
+        raise RuntimeError(f"GigaChat check failed after retries: {last_error}")
+
+    def _classify(self, text: str) -> bool:
+        cleaned_text = remove_non_bmp_chars(text)
+        cleaned_text = cleaned_text.replace("\n", " ").replace("\r", " ")
+        cleaned_text = re.sub(r"\s+", " ", cleaned_text).strip()
+        cleaned_text = cleaned_text[: self.settings.gigachat_max_text_chars]
+
+        prompt = (
+            "Определи, относится ли сообщение к новостям, анонсам, срокам регистрации, "
+            "итогам или результатам олимпиад, соревнований по программированию, математике "
+            "или инженерным конкурсам для школьников/студентов. "
+            "Ответь строго одним словом: ДА или НЕТ.\n\n"
+            f"Сообщение: {cleaned_text}"
+        )
+
+        payload = {
+            "model": self.settings.gigachat_model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "Ты строгий бинарный классификатор Telegram-сообщений. "
+                        "Не объясняй ответ. Не добавляй Markdown. Верни только ДА или НЕТ."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": prompt,
+                },
+            ],
+            "temperature": 0,
+            "max_tokens": 8,
+        }
+
+        response = requests.post(
+            self.CHAT_COMPLETIONS_URL,
+            headers={
+                "Authorization": f"Bearer {self._get_access_token()}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            json=payload,
+            timeout=self.settings.gigachat_timeout_seconds,
+            verify=self.settings.gigachat_verify_ssl,
+        )
+
+        if response.status_code == 401:
+            self._drop_access_token()
+            response = requests.post(
+                self.CHAT_COMPLETIONS_URL,
+                headers={
+                    "Authorization": f"Bearer {self._get_access_token(force_refresh=True)}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+                json=payload,
+                timeout=self.settings.gigachat_timeout_seconds,
+                verify=self.settings.gigachat_verify_ssl,
+            )
+
+        response.raise_for_status()
+        content = self._extract_answer(response.json())
+        return self._parse_answer(content)
+
+    def _get_access_token(self, force_refresh: bool = False) -> str:
+        now_ms = int(time.time() * 1000)
+        if (
+            not force_refresh
+            and self._access_token
+            and self._access_token_expires_at_ms > now_ms + 60_000
+        ):
+            return self._access_token
+
+        auth_header = self._build_auth_header()
+        response = requests.post(
+            self.OAUTH_URL,
+            headers={
+                "Authorization": auth_header,
+                "RqUID": str(uuid.uuid4()),
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json",
+            },
+            data={"scope": self.settings.gigachat_scope},
+            timeout=self.settings.gigachat_timeout_seconds,
+            verify=self.settings.gigachat_verify_ssl,
+        )
+        response.raise_for_status()
+
+        data = response.json()
+        access_token = str(data.get("access_token", "")).strip()
+        if not access_token:
+            raise RuntimeError("GigaChat OAuth response does not contain access_token")
+
+        expires_at = data.get("expires_at")
+        if expires_at is None:
+            expires_at_ms = int((time.time() + 25 * 60) * 1000)
+        else:
+            expires_at_ms = int(expires_at)
+
+        self._access_token = access_token
+        self._access_token_expires_at_ms = expires_at_ms
+        return access_token
+
+    def _drop_access_token(self) -> None:
+        self._access_token = None
+        self._access_token_expires_at_ms = 0
+
+    def _build_auth_header(self) -> str:
+        if not self.settings.gigachat_auth_key:
+            raise ConfigurationError("GIGACHAT_AUTH_KEY is required")
+
+        auth_key = self.settings.gigachat_auth_key.strip()
+        if auth_key.lower().startswith("basic "):
+            return auth_key
+        return f"Basic {auth_key}"
+
+    @staticmethod
+    def _extract_answer(response_json: dict[str, Any]) -> str:
+        try:
+            return str(response_json["choices"][0]["message"]["content"]).strip()
+        except (KeyError, IndexError, TypeError) as error:
+            raise RuntimeError(f"Unexpected GigaChat response shape: {response_json}") from error
+
+    @staticmethod
+    def _parse_answer(answer: str) -> bool:
+        normalized = answer.strip().lower()
+        normalized = normalized.replace(".", "").replace("!", "").replace("\"", "")
+        normalized = normalized.replace("'", "")
+
+        if normalized.startswith("да") or normalized.startswith("yes"):
+            return True
+        if normalized.startswith("нет") or normalized.startswith("no"):
+            return False
+
+        positive_words = ["олимп", "соревнован", "конкурс", "задач", "турнир", "чемпионат"]
+        negative_words = ["не относится", "не связано", "нет"]
+        if any(word in normalized for word in negative_words):
+            return False
+        if any(word in normalized for word in positive_words):
+            return True
+
+        raise RuntimeError(f"Cannot parse GigaChat answer as binary decision: {answer}")
 
 
 class SimpleOlympiadBot:
@@ -530,17 +440,21 @@ class SimpleOlympiadBot:
         self.settings = settings
         self.ids_to_chat = settings.ids_to_chat
         self.monitor_channels = settings.monitor_channels
-        self.user_client: Optional[TelegramClient] = None
-        self.bot: Optional[telebot.TeleBot] = None
-        self.deepseek_checker = DeepSeekChecker(settings)
+        self.user_client: TelegramClient | None = None
+        self.bot: telebot.TeleBot | None = None
+        self.gigachat_classifier = GigaChatClassifier(settings) if settings.gigachat_enabled else None
         self.check_count = 0
         self.message_queue = MessageQueue(max_queue_size=50)
-        self.queue_worker_task: Optional[asyncio.Task[Any]] = None
-        self.stats_print_task: Optional[asyncio.Task[Any]] = None
+        self.queue_worker_task: asyncio.Task[Any] | None = None
+        self.stats_print_task: asyncio.Task[Any] | None = None
         self.is_running = True
 
     def setup_clients(self) -> None:
-        self.user_client = TelegramClient(".runtime/user_session", self.settings.telegram_api_id, self.settings.telegram_api_hash)
+        self.user_client = TelegramClient(
+            ".runtime/user_session",
+            self.settings.telegram_api_id,
+            self.settings.telegram_api_hash,
+        )
         self.bot = telebot.TeleBot(self.settings.telegram_bot_token)
 
     async def authorize_user(self) -> bool:
@@ -577,18 +491,26 @@ class SimpleOlympiadBot:
 
     async def should_send_message(self, text: str) -> bool:
         self.check_count += 1
+        print(f"Checking message #{self.check_count}")
+
         if not self.is_olympiad_related(text):
+            print("Keyword prefilter: SKIP")
             return False
 
-        if not self.settings.deepseek_enabled:
+        print("Keyword prefilter: PASS")
+        if not self.gigachat_classifier:
+            print("GigaChat is disabled, using keyword prefilter only.")
             return True
 
-        loop = asyncio.get_event_loop()
         try:
-            return await loop.run_in_executor(None, self.deepseek_checker.check_message, text)
+            return await asyncio.to_thread(self.gigachat_classifier.check_message, text)
         except Exception as error:
-            print(f"DeepSeek failed, falling back to keyword filter: {error}")
-            return True
+            print(f"GigaChat failed: {error}")
+            if self.settings.gigachat_fail_open:
+                print("Fail-open mode is enabled: SEND because keyword prefilter passed.")
+                return True
+            print("Fail-open mode is disabled: SKIP.")
+            return False
 
     def format_message(self, text: str, channel_name: str, message_id: int) -> str:
         text = clean_text_for_telegram(text)
@@ -612,7 +534,13 @@ class SimpleOlympiadBot:
 #олимпиада #программирование
 """.strip()
 
-    def send_notification_with_retry(self, text: str, channel_name: str, message_id: int, max_retries: int = 3) -> bool:
+    def send_notification_with_retry(
+        self,
+        text: str,
+        channel_name: str,
+        message_id: int,
+        max_retries: int = 3,
+    ) -> bool:
         assert self.bot is not None
         for attempt in range(max_retries):
             try:
@@ -627,7 +555,9 @@ class SimpleOlympiadBot:
                         )
                     except Exception as error:
                         print(f"Cannot send formatted message to {chat_id}: {error}")
-                        fallback_message = f"НОВОСТЬ ОБ ОЛИМПИАДЕ\n\n{text[:200]}...\n\nИсточник: {channel_name}"
+                        fallback_message = (
+                            f"НОВОСТЬ ОБ ОЛИМПИАДЕ\n\n{text[:200]}...\n\nИсточник: {channel_name}"
+                        )
                         self.bot.send_message(chat_id, fallback_message)
                 return True
             except Exception as error:
@@ -643,7 +573,10 @@ class SimpleOlympiadBot:
             return
 
         if await self.should_send_message(text):
+            print(f"Sending olympiad news from {task.channel_name}: {text[:80]}")
             self.send_notification_with_retry(text, task.channel_name, task.message_id)
+        else:
+            print(f"Message skipped: {text[:80]}")
 
     async def handle_new_message(self, event: Any) -> None:
         text = event.message.text or event.message.message
@@ -675,8 +608,7 @@ class SimpleOlympiadBot:
                     await self.process_message_task(task)
                     self.message_queue.task_done()
                 except Exception as error:
-                    self.message_queue.stats["errors"] += 1
-                    self.message_queue.queue.task_done()
+                    self.message_queue.task_failed()
                     print(f"Task processing failed: {error}")
             except asyncio.TimeoutError:
                 continue
@@ -720,12 +652,6 @@ class SimpleOlympiadBot:
         if not await self.authorize_user():
             return
 
-        if self.settings.deepseek_enabled:
-            loop = asyncio.get_event_loop()
-            initialized = await loop.run_in_executor(None, self.deepseek_checker.initialize_driver)
-            if not initialized:
-                print("DeepSeek initialization failed. The bot will use keyword filtering only.")
-
         self.queue_worker_task = asyncio.create_task(self.queue_worker())
         self.stats_print_task = asyncio.create_task(self.print_queue_stats())
         await self.start_monitoring_async()
@@ -741,7 +667,6 @@ class SimpleOlympiadBot:
                 self.queue_worker_task.cancel()
             if self.stats_print_task:
                 self.stats_print_task.cancel()
-            self.deepseek_checker.cleanup()
             print(f"Final stats: {self.message_queue.get_stats()}")
 
 

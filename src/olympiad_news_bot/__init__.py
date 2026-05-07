@@ -1,1 +1,1 @@
-"""Olympiad news bot package."""
+"""Olympiad news Telegram bot."""
