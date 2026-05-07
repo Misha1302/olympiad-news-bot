@@ -1,0 +1,1 @@
+"""Olympiad news bot package."""
