@@ -1,5 +1,4 @@
 import asyncio
-import html
 import os
 import re
 import threading
@@ -35,6 +34,8 @@ SECRET_NAMES = (
     "GIGACHAT_FAIL_OPEN",
     "GIGACHAT_MAX_TEXT_CHARS",
 )
+
+MAX_TELEGRAM_MESSAGE_LENGTH = 4096
 
 
 def load_local_secrets() -> dict[str, Any]:
@@ -189,6 +190,30 @@ def read_required_config(name: str) -> str:
     return value
 
 
+def split_text_for_telegram(text: str) -> list[str]:
+    if len(text) <= MAX_TELEGRAM_MESSAGE_LENGTH:
+        return [text]
+
+    parts = []
+    remaining_text = text
+    while len(remaining_text) > MAX_TELEGRAM_MESSAGE_LENGTH:
+        split_at = remaining_text.rfind("\n", 1, MAX_TELEGRAM_MESSAGE_LENGTH + 1)
+        if split_at > 0:
+            split_at += 1
+        else:
+            split_at = remaining_text.rfind(" ", 1, MAX_TELEGRAM_MESSAGE_LENGTH + 1)
+            if split_at <= 0:
+                split_at = MAX_TELEGRAM_MESSAGE_LENGTH
+
+        parts.append(remaining_text[:split_at])
+        remaining_text = remaining_text[split_at:]
+
+    if remaining_text:
+        parts.append(remaining_text)
+
+    return parts
+
+
 @dataclass(frozen=True)
 class Settings:
     telegram_api_id: int
@@ -244,7 +269,6 @@ class MessageTask:
     text: str
     channel_name: str
     message_id: int
-    event: Any
     created_at: datetime | None = None
 
     def __post_init__(self) -> None:
@@ -313,24 +337,6 @@ def remove_non_bmp_chars(text: str) -> str:
         flags=re.UNICODE,
     )
     return emoji_pattern.sub("", text).strip()
-
-
-def clean_text_for_telegram(text: str) -> str:
-    if not text:
-        return text
-
-    safe_chars = re.compile(
-        r"[^\w\s\d\.,!?\:;\-\(\)\[\]\{\}«»\"'\n\r\t\u0400-\u04FF\u0500-\u052F\u2DE0-\u2DFF\uA640-\uA69F]",
-        re.UNICODE,
-    )
-    text = safe_chars.sub("", text)
-    text = re.sub(r"\s+", " ", text)
-    text = html.escape(text)
-
-    for char in r"_*[]()~`>#+-=|{}.!":
-        text = text.replace(char, f"\\{char}")
-
-    return text.strip()
 
 
 class GigaChatClassifier:
@@ -612,26 +618,21 @@ class SimpleOlympiadBot:
             return False
 
     def format_message(self, text: str, channel_name: str, message_id: int) -> str:
-        text = clean_text_for_telegram(text)
-        if len(text) > 300:
-            text = text[:300] + "..."
+        source_text = self.format_source(channel_name, message_id)
+        return (
+            "НОВОСТЬ ОБ ОЛИМПИАДЕ\n\n"
+            f"{text}\n\n"
+            f"Источник: {source_text}\n"
+            f"Время: {datetime.now().strftime('%H:%M %d.%m.%Y')}\n\n"
+            "#олимпиада #программирование"
+        )
 
+    @staticmethod
+    def format_source(channel_name: str, message_id: int) -> str:
         if channel_name.startswith("@"):
-            channel_link = f"https://t.me/{channel_name[1:]}/{message_id}"
-            source_text = f"[{channel_name}]({channel_link})"
-        else:
-            source_text = f"Канал: {clean_text_for_telegram(channel_name)}"
+            return f"{channel_name}: https://t.me/{channel_name[1:]}/{message_id}"
 
-        return f"""
-*НОВОСТЬ ОБ ОЛИМПИАДЕ*
-
-{text}
-
-*Источник:* {source_text}
-*Время:* {datetime.now().strftime('%H:%M %d.%m.%Y')}
-
-#олимпиада #программирование
-""".strip()
+        return channel_name
 
     def send_notification_with_retry(
         self,
@@ -641,23 +642,18 @@ class SimpleOlympiadBot:
         max_retries: int = 3,
     ) -> bool:
         assert self.bot is not None
+        formatted_message = self.format_message(text, channel_name, message_id)
+        message_parts = split_text_for_telegram(formatted_message)
+
         for attempt in range(max_retries):
             try:
-                formatted_message = self.format_message(text, channel_name, message_id)
                 for chat_id in self.ids_to_chat:
-                    try:
+                    for message_part in message_parts:
                         self.bot.send_message(
                             chat_id,
-                            formatted_message,
-                            parse_mode="Markdown",
+                            message_part,
                             disable_web_page_preview=True,
                         )
-                    except Exception as error:
-                        print(f"Cannot send formatted message to {chat_id}: {error}")
-                        fallback_message = (
-                            f"НОВОСТЬ ОБ ОЛИМПИАДЕ\n\n{text[:200]}...\n\nИсточник: {channel_name}"
-                        )
-                        self.bot.send_message(chat_id, fallback_message)
                 return True
             except Exception as error:
                 wait_time = 2 ** attempt
@@ -667,7 +663,7 @@ class SimpleOlympiadBot:
         return False
 
     async def process_message_task(self, task: MessageTask) -> None:
-        text = task.event.message.text or task.event.message.message
+        text = task.text
         if not text or not text.strip():
             return
 
@@ -694,7 +690,6 @@ class SimpleOlympiadBot:
             text=text,
             channel_name=channel_name,
             message_id=event.message.id,
-            event=event,
         )
         await self.message_queue.put(task)
 
