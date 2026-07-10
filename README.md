@@ -1,83 +1,58 @@
 # Olympiad News Bot
 
-Простой Telegram-бот для мониторинга олимпиадных каналов.
-
-Бот читает сообщения из заданных Telegram-каналов, проверяет их по ключевым словам и через GigaChat, а затем отправляет подходящие новости в нужный чат.
+Telegram-бот для мониторинга олимпиадных каналов. Бот читает новые сообщения через пользовательскую Telegram-сессию, выполняет быстрый локальный prefilter, при необходимости проверяет сообщение через GigaChat и отправляет подходящие новости в заданные чаты.
 
 Браузер, Selenium, ChromeDriver и cookies не нужны.
 
-## Самый простой запуск
+## Требования
 
-Для первого запуска используйте готовый скрипт:
+- Python **3.12**;
+- `TELEGRAM_API_ID` и `TELEGRAM_API_HASH` с `my.telegram.org`;
+- `TELEGRAM_BOT_TOKEN` от `@BotFather`;
+- `IDS_TO_CHAT` — id получателей;
+- `GIGACHAT_AUTH_KEY`, если включена AI-фильтрация.
+
+Поддерживаемый диапазон Python зафиксирован в `pyproject.toml`: `>=3.12,<3.13`.
+
+## Быстрый запуск
+
+Для первой установки:
 
 ```bash
 bash setup_and_run.sh
 ```
 
-Скрипт сам:
+Скрипт скачает или обновит репозиторий в `~/olympiad-news-bot`, проверит наличие Python 3.12, создаст `.venv`, установит пакет, предложит заполнить секреты и запустит бота.
 
-1. определит Ubuntu/Debian, Fedora или Arch;
-2. установит системные зависимости;
-3. скачает или обновит репозиторий в `~/olympiad-news-bot`;
-4. создаст виртуальное окружение `.venv`;
-5. установит зависимости из `requirements.txt`;
-6. спросит секреты;
-7. создаст локальный `SECRETS.py`;
-8. запустит бота.
-
-При первом запуске Telegram может попросить номер телефона, код входа и пароль двухэтапной аутентификации.
-
-## Повторный запуск
-
-Если проект уже установлен, зайдите в папку проекта и используйте короткий скрипт:
+Для повторного запуска:
 
 ```bash
 cd ~/olympiad-news-bot
 bash run.sh
 ```
 
-`run.sh` проверит `SECRETS.py`, создаст `.venv`, если его нет, установит зависимости и запустит бота.
+При первом запуске Telegram может попросить номер телефона, код входа и пароль двухэтапной аутентификации.
 
-## Что нужно подготовить заранее
-
-Перед запуском желательно иметь:
-
-1. `TELEGRAM_API_ID` и `TELEGRAM_API_HASH` — взять на https://my.telegram.org.
-2. `TELEGRAM_BOT_TOKEN` — создать бота через `@BotFather`.
-3. `IDS_TO_CHAT` — id чата или пользователя, куда бот будет отправлять новости.
-4. `GIGACHAT_AUTH_KEY` — ключ авторизации GigaChat API.
-
-Если GigaChat пока не нужен, при вопросе `Use GigaChat filtering?` ответьте `n`.
-
-## Как остановить бота
-
-В терминале нажмите:
-
-```text
-Ctrl+C
-```
-
-Если бот завис или был случайно запущен несколько раз:
+## Ручная установка
 
 ```bash
-pkill -f olympiad_news_bot
-```
-
-## Как поменять настройки
-
-Основные настройки лежат в локальном файле:
-
-```text
-SECRETS.py
-```
-
-Его можно открыть и изменить:
-
-```bash
+git clone https://github.com/Misha1302/olympiad-news-bot.git
+cd olympiad-news-bot
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e .
+python -m pip check
+cp SECRETS.example.py SECRETS.py
 nano SECRETS.py
+python -m olympiad_news_bot.main
 ```
 
-Например, каналы можно указать так:
+## Конфигурация
+
+Основной локальный вариант — `SECRETS.py`, созданный из `SECRETS.example.py`. Переменные окружения и `.env` поддерживаются как fallback для CI и hosting-платформ.
+
+Пример каналов:
 
 ```python
 MONITOR_CHANNELS = [
@@ -87,66 +62,95 @@ MONITOR_CHANNELS = [
 ]
 ```
 
-Если `MONITOR_CHANNELS` пустой, бот использует список каналов по умолчанию из кода.
+Если список пуст, используются встроенные каналы по умолчанию.
 
-## Частые ошибки
+Важные настройки надёжности:
 
-### `sqlite3.OperationalError: database is locked`
+```python
+TELEGRAM_SEND_MAX_RETRIES = 3
+MESSAGE_QUEUE_SIZE = 100
+DELIVERY_RECEIPT_DB_PATH = ".runtime/delivery.sqlite3"
+GIGACHAT_FAIL_OPEN = True
+```
 
-Обычно это значит, что уже запущена другая копия бота с той же Telegram-сессией.
+- отправка ретраится отдельно для каждого получателя и каждой части сообщения; успешные части записываются в SQLite receipt store и пропускаются при обычном повторе или рестарте;
+- очередь использует backpressure и не отбрасывает новые сообщения молча;
+- при завершении runtime дожидается обработки уже принятых сообщений;
+- `GIGACHAT_FAIL_OPEN=True` разрешает отправку после успешного keyword-prefilter, если GigaChat временно недоступен; `False` блокирует такую отправку.
 
-Исправление:
+## Архитектура
+
+```text
+TelethonMessageSource
+        ↓ IncomingMessage
+MessageQueue / BotRuntime
+        ↓
+NewsProcessor
+  ├─ MessagePrefilter
+  ├─ MessageClassifier
+  ├─ NotificationFormatter
+  └─ NotificationSink
+        ↓
+Telegram Bot API
+```
+
+Основные границы:
+
+- `domain.py` — сообщения, решения классификатора, результаты обработки и доставки;
+- `ports.py` — небольшие capability-контракты application-слоя;
+- `application.py` — высокоуровневая политика без зависимостей от Telethon, `requests` и Bot API;
+- `adapters/` — GigaChat и Telethon;
+- `delivery.py` — Telegram delivery adapter с независимыми ретраями;
+- `adapters/sqlite_receipts.py` — durable best-effort защита от повторной отправки уже подтверждённых частей;
+- `runtime.py` и `queueing.py` — lifecycle, backpressure, graceful drain и наблюдаемая статистика;
+- `main.py` — composition root.
+
+Архитектурный тест запрещает application-слою напрямую импортировать `telethon`, `telebot`, `requests` и `urllib3`.
+
+## Проверки
+
+```bash
+PYTHONPATH=src python -m compileall -q src tests
+PYTHONPATH=src python -m unittest discover -s tests -v
+```
+
+CI дополнительно устанавливает проект на Python 3.12 и запускает `pip check`. `pyproject.toml` является единственным каноническим источником dependency metadata; `requirements.txt` только делегирует установку editable-пакету.
+
+## Остановка
+
+В терминале нажмите `Ctrl+C`. Runtime перестаёт принимать новые сообщения и дожидается обработки очереди.
+
+Если случайно запущено несколько копий:
 
 ```bash
 pkill -f olympiad_news_bot
 rm -f .runtime/*.session-journal .runtime/*.session-wal .runtime/*.session-shm
 ```
 
-После этого запустите бота снова:
+## Ошибка SSL при обращении к GigaChat
 
-```bash
-bash run.sh
-```
-
-### `ModuleNotFoundError: No module named 'imghdr'`
-
-Скорее всего виртуальное окружение создано на слишком новой версии Python.
-
-Проект рассчитан на Python 3.12. Удалите старое окружение и запустите скрипт снова:
-
-```bash
-rm -rf .venv
-bash run.sh
-```
-
-### Ошибка SSL при обращении к GigaChat
-
-Сначала попробуйте безопасный вариант:
+Сначала оставьте безопасный режим:
 
 ```python
 GIGACHAT_VERIFY_SSL = True
 ```
 
-Если система не доверяет сертификатам GigaChat, можно создать локальный bundle сертификатов:
+При необходимости создайте локальный bundle сертификатов:
 
 ```bash
 source .venv/bin/activate
 python scripts/install_gigachat_certs.py
 ```
 
-Скрипт напечатает команду `export REQUESTS_CA_BUNDLE=...`. Выполните её перед запуском бота.
-
-Временный небезопасный вариант в `SECRETS.py`:
+Скрипт проверит PEM-структуру сертификатов, напечатает их SHA-256 и предложит значение `GIGACHAT_CA_BUNDLE`. Bundle передаётся только GigaChat-адаптеру и не меняет global trust процесса. Временный небезопасный вариант:
 
 ```python
 GIGACHAT_VERIFY_SSL = False
 ```
 
-Используйте его только если нужно срочно проверить запуск.
+Используйте его только для диагностики.
 
-## Какие файлы нельзя выкладывать в GitHub
-
-Не коммитьте:
+## Что нельзя коммитить
 
 ```text
 SECRETS.py
@@ -162,20 +166,4 @@ __pycache__/
 .venv/
 ```
 
-Эти файлы уже добавлены в `.gitignore`, но всё равно проверяйте перед коммитом.
-
-## Для ручного запуска без скриптов
-
-Обычно это не нужно. Используйте `setup_and_run.sh` для первого запуска и `run.sh` для повторных запусков.
-
-Ручной вариант нужен только для отладки:
-
-```bash
-python3.12 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-cp SECRETS.example.py SECRETS.py
-nano SECRETS.py
-PYTHONPATH=src python -m olympiad_news_bot.main
-```
+Если секрет или Telegram-сессия попали в публичный commit, считайте их скомпрометированными и замените.
