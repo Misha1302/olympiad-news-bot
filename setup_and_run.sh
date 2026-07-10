@@ -3,9 +3,6 @@ set -euo pipefail
 
 REPO_URL="https://github.com/Misha1302/olympiad-news-bot.git"
 PROJECT_DIR="$HOME/olympiad-news-bot"
-PYTHON_BIN="python3"
-
-echo "== Olympiad News Bot setup =="
 
 install_system_dependencies() {
     if command -v apt-get >/dev/null 2>&1; then
@@ -18,12 +15,28 @@ install_system_dependencies() {
     elif command -v pacman >/dev/null 2>&1; then
         echo "Detected Arch"
         sudo pacman -S --needed --noconfirm git python python-pip ca-certificates
-        PYTHON_BIN="python"
     else
         echo "Unsupported Linux distribution."
-        echo "Install manually: git, python3, python3-venv, python3-pip"
+        echo "Install Git, Python 3.12, venv, pip and CA certificates manually."
         exit 1
     fi
+}
+
+resolve_python_312() {
+    if command -v python3.12 >/dev/null 2>&1; then
+        printf '%s\n' "python3.12"
+        return
+    fi
+
+    if command -v python3 >/dev/null 2>&1 \
+        && [ "$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')" = "3.12" ]; then
+        printf '%s\n' "python3"
+        return
+    fi
+
+    echo "Python 3.12 is required, but the package manager did not provide it." >&2
+    echo "Install Python 3.12 for your distribution and run setup_and_run.sh again." >&2
+    exit 1
 }
 
 clone_or_update_repo() {
@@ -32,7 +45,7 @@ clone_or_update_repo() {
         cd "$PROJECT_DIR"
         git fetch origin
         git checkout main
-        git pull origin main
+        git pull --ff-only origin main
     else
         echo "Cloning repository..."
         git clone "$REPO_URL" "$PROJECT_DIR"
@@ -43,18 +56,26 @@ clone_or_update_repo() {
 
 create_virtualenv() {
     cd "$PROJECT_DIR"
+    local python_bin
+    python_bin="$(resolve_python_312)"
+
+    if [ -x ".venv/bin/python" ]; then
+        local venv_version
+        venv_version="$(.venv/bin/python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+        if [ "$venv_version" != "3.12" ]; then
+            echo "Existing .venv uses Python $venv_version; recreating it."
+            rm -rf .venv
+        fi
+    fi
 
     if [ ! -d ".venv" ]; then
-        echo "Creating Python virtual environment..."
-        "$PYTHON_BIN" -m venv .venv
+        "$python_bin" -m venv .venv
     fi
 
     source .venv/bin/activate
-
-    echo "Installing Python dependencies..."
     python -m pip install --upgrade pip
-    python -m pip install -r requirements.txt
-
+    python -m pip install -e .
+    python -m pip check
     mkdir -p .runtime
 }
 
@@ -68,19 +89,15 @@ create_secrets_if_missing() {
 
     echo
     echo "Now enter bot secrets."
-    echo "You can get TELEGRAM_API_ID and TELEGRAM_API_HASH here: https://my.telegram.org"
-    echo "You can get TELEGRAM_BOT_TOKEN from @BotFather"
+    echo "TELEGRAM_API_ID and TELEGRAM_API_HASH: https://my.telegram.org"
+    echo "TELEGRAM_BOT_TOKEN: @BotFather"
     echo
 
     read -r -p "TELEGRAM_API_ID: " TELEGRAM_API_ID
     read -r -p "TELEGRAM_API_HASH: " TELEGRAM_API_HASH
     read -r -p "TELEGRAM_BOT_TOKEN: " TELEGRAM_BOT_TOKEN
-    read -r -p "IDS_TO_CHAT, comma-separated, example 123456789,-1001234567890: " IDS_TO_CHAT
-
-    echo
-    read -r -p "MONITOR_CHANNELS, comma-separated, empty = default channels: " MONITOR_CHANNELS
-
-    echo
+    read -r -p "IDS_TO_CHAT, comma-separated: " IDS_TO_CHAT
+    read -r -p "MONITOR_CHANNELS, comma-separated, empty = defaults: " MONITOR_CHANNELS
     read -r -p "Use GigaChat filtering? y/n [y]: " USE_GIGACHAT
     USE_GIGACHAT="${USE_GIGACHAT:-y}"
 
@@ -92,20 +109,17 @@ create_secrets_if_missing() {
         GIGACHAT_AUTH_KEY=""
     fi
 
-    export TELEGRAM_API_ID
-    export TELEGRAM_API_HASH
-    export TELEGRAM_BOT_TOKEN
-    export IDS_TO_CHAT
-    export MONITOR_CHANNELS
-    export GIGACHAT_ENABLED
-    export GIGACHAT_AUTH_KEY
+    export TELEGRAM_API_ID TELEGRAM_API_HASH TELEGRAM_BOT_TOKEN IDS_TO_CHAT
+    export MONITOR_CHANNELS GIGACHAT_ENABLED GIGACHAT_AUTH_KEY
 
     python - <<'PY'
 import json
 import os
 
+
 def py_string(name: str) -> str:
     return json.dumps(os.environ.get(name, ""), ensure_ascii=False)
+
 
 content = f'''# Local secrets for olympiad-news-bot.
 # Do not commit this file to Git.
@@ -113,15 +127,11 @@ content = f'''# Local secrets for olympiad-news-bot.
 TELEGRAM_API_ID = int({py_string("TELEGRAM_API_ID")})
 TELEGRAM_API_HASH = {py_string("TELEGRAM_API_HASH")}
 TELEGRAM_BOT_TOKEN = {py_string("TELEGRAM_BOT_TOKEN")}
-
 IDS_TO_CHAT = {py_string("IDS_TO_CHAT")}
-
-# Empty string means: use default channels from the code.
 MONITOR_CHANNELS = {py_string("MONITOR_CHANNELS")}
 
 GIGACHAT_ENABLED = {py_string("GIGACHAT_ENABLED")}
 GIGACHAT_AUTH_KEY = {py_string("GIGACHAT_AUTH_KEY")}
-
 GIGACHAT_SCOPE = "GIGACHAT_API_PERS"
 GIGACHAT_MODEL = "GigaChat"
 GIGACHAT_VERIFY_SSL = True
@@ -129,6 +139,11 @@ GIGACHAT_TIMEOUT_SECONDS = 30
 GIGACHAT_MAX_RETRIES = 3
 GIGACHAT_FAIL_OPEN = True
 GIGACHAT_MAX_TEXT_CHARS = 5000
+GIGACHAT_CA_BUNDLE = None
+
+TELEGRAM_SEND_MAX_RETRIES = 3
+MESSAGE_QUEUE_SIZE = 100
+DELIVERY_RECEIPT_DB_PATH = ".runtime/delivery.sqlite3"
 '''
 
 with open("SECRETS.py", "w", encoding="utf-8") as file:
@@ -142,13 +157,8 @@ PY
 run_bot() {
     cd "$PROJECT_DIR"
     source .venv/bin/activate
-
-    echo
     echo "Starting bot..."
-    echo "On first run, Telegram may ask for phone number and login code."
-    echo
-
-    PYTHONPATH="$PROJECT_DIR/src" python -m olympiad_news_bot.main
+    python -m olympiad_news_bot.main
 }
 
 install_system_dependencies
