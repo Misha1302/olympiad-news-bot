@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "olympiad-news-bot"
+version = "0.2.0"
+description = "Telegram bot that monitors olympiad news channels"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "certifi==2025.11.12",
+  "charset-normalizer==3.4.4",
+  "idna==3.11",
+  "pyaes==1.6.1",
+  "pyasn1==0.6.1",
+  "pyTelegramBotAPI==4.9.0",
+  "python-dotenv==1.2.1",
+  "requests==2.32.5",
+  "rsa==4.9.1",
+  "Telethon>=1.36,<2",
+  "urllib3==2.6.2",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
